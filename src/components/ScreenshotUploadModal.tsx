@@ -85,6 +85,46 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
     }
   };
 
+  const compressImageForAI = (dataUrl: string, maxDimension = 1600): Promise<{ base64: string; mimeType: string }> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxDimension || height > maxDimension) {
+          if (width > height) {
+            height = Math.round((height * maxDimension) / width);
+            width = maxDimension;
+          } else {
+            width = Math.round((width * maxDimension) / height);
+            height = maxDimension;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+        }
+        const compressedUrl = canvas.toDataURL('image/jpeg', 0.85);
+        resolve({
+          base64: compressedUrl,
+          mimeType: 'image/jpeg',
+        });
+      };
+      img.onerror = () => {
+        resolve({ base64: dataUrl, mimeType: imageFile?.type || 'image/png' });
+      };
+      img.src = dataUrl;
+    });
+  };
+
   const handleProcessImage = async () => {
     if (!imagePreviewUrl) return;
 
@@ -92,23 +132,37 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
     setErrorMessage(null);
 
     try {
-      const mimeType = imageFile?.type || 'image/png';
+      // 1. Compress image to max 1600px & JPEG to ensure lightweight payload
+      const { base64, mimeType } = await compressImageForAI(imagePreviewUrl);
+
+      // 2. Post to backend endpoint
       const response = await fetch('/api/parse-financial-screenshot', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          imageBase64: imagePreviewUrl,
+          imageBase64: base64,
           mimeType,
         }),
       });
 
-      const resData = await response.json();
-
-      if (!response.ok || !resData.success) {
-        throw new Error(resData.error || 'Failed to extract financial statement data.');
+      // 3. Safely read text first to prevent JSON.parse crashes on empty/HTML error bodies
+      const responseText = await response.text();
+      let resData: any = {};
+      try {
+        resData = responseText ? JSON.parse(responseText) : {};
+      } catch (_e) {
+        throw new Error(
+          `Server returned non-JSON response (HTTP ${response.status}): ${
+            responseText ? responseText.slice(0, 120) : 'Empty response received from server.'
+          }`
+        );
       }
 
-      const { monthName, items } = resData.data;
+      if (!response.ok || !resData.success) {
+        throw new Error(resData.error || resData.message || 'Failed to extract financial statement data.');
+      }
+
+      const { monthName, items } = resData.data || {};
 
       setExtractedMonthName(monthName || '');
       setExtractedItems(items || []);
@@ -128,7 +182,7 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
       setMatchedMapping(mappings);
       setIsStepReview(true);
     } catch (err: any) {
-      console.error(err);
+      console.error('Screenshot processing error:', err);
       setErrorMessage(err.message || 'An unexpected error occurred while parsing the image.');
     } finally {
       setIsProcessing(false);

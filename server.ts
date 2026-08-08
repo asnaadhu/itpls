@@ -9,6 +9,7 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
   // Initialize server-side Supabase client (bypasses browser CORS / fetch restrictions)
   const SUPABASE_URL = (
@@ -138,7 +139,7 @@ async function startServer() {
       }
 
       // Strip data URL header if present (e.g., data:image/png;base64,...)
-      const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, "");
+      const cleanBase64 = imageBase64.replace(/^data:image\/[a-zA-Z0-9\+\-\.]+;base64,/, "").trim();
 
       const ai = new GoogleGenAI({
         apiKey,
@@ -164,7 +165,7 @@ Note:
         contents: [
           {
             inlineData: {
-              mimeType,
+              mimeType: mimeType || "image/jpeg",
               data: cleanBase64,
             },
           },
@@ -214,7 +215,21 @@ Note:
       });
 
       const responseText = response.text || "{}";
-      const parsedData = JSON.parse(responseText);
+      let parsedData: any = {};
+      try {
+        parsedData = JSON.parse(responseText);
+      } catch (_jsonErr) {
+        const cleaned = responseText.replace(/```json/gi, "").replace(/```/g, "").trim();
+        try {
+          parsedData = JSON.parse(cleaned);
+        } catch (_2) {
+          console.error("Failed to parse Gemini response text:", responseText);
+          return res.status(500).json({
+            success: false,
+            error: "Gemini AI response could not be parsed into valid JSON."
+          });
+        }
+      }
 
       return res.json({
         success: true,
