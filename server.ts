@@ -125,16 +125,17 @@ async function startServer() {
   // API Route to parse financial screenshot using Gemini Vision
   app.post("/api/parse-financial-screenshot", async (req, res) => {
     try {
-      const { imageBase64, mimeType = "image/png" } = req.body;
+      const { imageBase64, mimeType = "image/jpeg" } = req.body;
 
       if (!imageBase64) {
-        return res.status(400).json({ error: "No imageBase64 provided" });
+        return res.status(400).json({ success: false, error: "No image payload provided" });
       }
 
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
         return res.status(500).json({
-          error: "GEMINI_API_KEY environment variable is not configured on server."
+          success: false,
+          error: "GEMINI_API_KEY environment variable is missing on server."
         });
       }
 
@@ -160,59 +161,80 @@ Note:
 - If a value is 0, blank, or missing, set it to 0.
 - Extract individual expense line items accurately (e.g., Salaries & Wages, Cost of Cell Phones, Dues and Subscriptions, etc.).`;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: [
-          {
-            inlineData: {
-              mimeType: mimeType || "image/jpeg",
-              data: cleanBase64,
-            },
-          },
-          {
-            text: promptText,
-          },
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              monthName: {
-                type: Type.STRING,
-                description: "Name of the month if visible in table headers",
-              },
-              items: {
-                type: Type.ARRAY,
-                description: "List of extracted financial line items",
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    lineItemName: {
-                      type: Type.STRING,
-                      description: "Exact or raw line item label",
-                    },
-                    actual: {
-                      type: Type.NUMBER,
-                      description: "Actual dollar amount",
-                    },
-                    budget: {
-                      type: Type.NUMBER,
-                      description: "Budget dollar amount",
-                    },
-                    lastYear: {
-                      type: Type.NUMBER,
-                      description: "Last Year dollar amount",
-                    },
-                  },
-                  required: ["lineItemName", "actual", "budget", "lastYear"],
+      // Supported Gemini API model names in order of preference
+      const modelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"];
+      let response: any = null;
+      let lastModelError: any = null;
+
+      for (const modelName of modelsToTry) {
+        try {
+          response = await ai.models.generateContent({
+            model: modelName,
+            contents: [
+              {
+                inlineData: {
+                  mimeType: mimeType || "image/jpeg",
+                  data: cleanBase64,
                 },
               },
+              {
+                text: promptText,
+              },
+            ],
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  monthName: {
+                    type: Type.STRING,
+                    description: "Name of the month if visible in table headers",
+                  },
+                  items: {
+                    type: Type.ARRAY,
+                    description: "List of extracted financial line items",
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        lineItemName: {
+                          type: Type.STRING,
+                          description: "Exact or raw line item label",
+                        },
+                        actual: {
+                          type: Type.NUMBER,
+                          description: "Actual dollar amount",
+                        },
+                        budget: {
+                          type: Type.NUMBER,
+                          description: "Budget dollar amount",
+                        },
+                        lastYear: {
+                          type: Type.NUMBER,
+                          description: "Last Year dollar amount",
+                        },
+                      },
+                      required: ["lineItemName", "actual", "budget", "lastYear"],
+                    },
+                  },
+                },
+                required: ["monthName", "items"],
+              },
             },
-            required: ["monthName", "items"],
-          },
-        },
-      });
+          });
+          if (response) {
+            break;
+          }
+        } catch (mErr: any) {
+          console.warn(`Gemini model ${modelName} failed:`, mErr?.message || mErr);
+          lastModelError = mErr;
+        }
+      }
+
+      if (!response) {
+        throw new Error(
+          lastModelError?.message || "All Gemini API models failed to process the screenshot."
+        );
+      }
 
       const responseText = response.text || "{}";
       let parsedData: any = {};
@@ -238,6 +260,7 @@ Note:
     } catch (err: any) {
       console.error("Error parsing financial screenshot:", err);
       return res.status(500).json({
+        success: false,
         error: err.message || "Failed to process screenshot with AI",
       });
     }
