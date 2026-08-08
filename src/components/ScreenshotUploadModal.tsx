@@ -1,19 +1,127 @@
 import React, { useState } from 'react';
 import { GoogleGenAI } from '@google/genai';
+import { createWorker } from 'tesseract.js';
 import {
   AlertCircle,
   Bot,
   Check,
   CheckCircle2,
+  Cpu,
   FileImage,
   Loader2,
   Sparkles,
   Upload,
   X,
+  Zap,
 } from 'lucide-react';
 import { MONTH_NAMES } from '../data/defaultData';
 import { YearData } from '../types';
 
+interface ExtractedItem {
+  lineItemName: string;
+  actual: number;
+  budget: number;
+  lastYear: number;
+}
+
+// 1. Pure Local Client-Side OCR Engine using Tesseract.js (No API key or server required)
+async function extractFinancialDataWithOCR(
+  imageSrc: string,
+  onProgress?: (statusMsg: string) => void
+): Promise<{ monthName: string; items: ExtractedItem[] }> {
+  if (onProgress) onProgress('Initializing local browser OCR engine...');
+  const worker = await createWorker('eng');
+
+  if (onProgress) onProgress('Scanning screenshot text with optical recognition...');
+  const ret = await worker.recognize(imageSrc);
+  await worker.terminate();
+
+  if (onProgress) onProgress('Parsing table rows & financial figures...');
+  const fullText = ret.data.text || '';
+  const lines = fullText.split('\n').map((l) => l.trim()).filter(Boolean);
+
+  let detectedMonth = '';
+  const items: ExtractedItem[] = [];
+
+  const monthList = [
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december'
+  ];
+
+  for (const rawLine of lines) {
+    const lowerLine = rawLine.toLowerCase();
+
+    // Detect month name
+    for (const m of monthList) {
+      if (lowerLine.includes(m) && !detectedMonth) {
+        detectedMonth = m.charAt(0).toUpperCase() + m.slice(1);
+      }
+    }
+
+    // Skip pure header rows
+    if (
+      /^(actual|budget|last year|variance|ytd|mtd|month|description|item|line item|%\s*change|period|dept)/i.test(
+        rawLine
+      ) &&
+      !/\d/.test(rawLine)
+    ) {
+      continue;
+    }
+
+    // Match numbers, parenthesized negatives e.g. (1,234), currency formatted $12,345 or plain figures
+    const numberMatches = rawLine.match(/\(?-?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?\)?|\d+(?:\.\d+)?/g);
+
+    if (numberMatches && numberMatches.length > 0) {
+      let label = rawLine;
+      for (const numStr of numberMatches) {
+        label = label.replace(numStr, '');
+      }
+
+      label = label
+        .replace(/[$%|\t]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9)]+$/g, '')
+        .trim();
+
+      if (label.length >= 2) {
+        const cleanNums = numberMatches
+          .map((str) => {
+            let clean = str.replace(/[$ ,]/g, '');
+            let isNeg = false;
+            if (clean.startsWith('(') && clean.endsWith(')')) {
+              isNeg = true;
+              clean = clean.slice(1, -1);
+            }
+            const val = parseFloat(clean);
+            return isNaN(val) ? 0 : isNeg ? -val : val;
+          })
+          .filter((val) => !isNaN(val));
+
+        if (cleanNums.length > 0 && label.length > 2) {
+          const actual = cleanNums[0] || 0;
+          const budget = cleanNums[1] ?? 0;
+          const lastYear = cleanNums[2] ?? 0;
+
+          if (!/^\d{4}$/.test(label)) {
+            items.push({
+              lineItemName: label,
+              actual,
+              budget,
+              lastYear,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    monthName: detectedMonth,
+    items,
+  };
+}
+
+// 2. Client-Side Gemini AI Engine
 async function extractFinancialDataClientSide(base64: string, mimeType: string, apiKey: string) {
   const ai = new GoogleGenAI({ apiKey });
   const cleanBase64 = base64.replace(/^data:image\/\w+;base64,/, '');
@@ -41,32 +149,50 @@ Return strictly valid JSON with format:
   ]
 }`;
 
-  const modelsToTry = ['gemini-3.6-flash', 'gemini-flash-latest'];
+  const modelsToTry = [
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+    'gemini-flash-latest',
+    'gemini-3.6-flash',
+    'gemini-2.5-pro',
+  ];
   let responseText = '';
   let lastErr: any = null;
 
   for (const modelName of modelsToTry) {
-    try {
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: [
-          {
-            parts: [
-              { inlineData: { mimeType, data: cleanBase64 } },
-              { text: promptText },
-            ],
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: [
+            {
+              parts: [
+                { inlineData: { mimeType, data: cleanBase64 } },
+                { text: promptText },
+              ],
+            },
+          ],
+          config: {
+            responseMimeType: 'application/json',
           },
-        ],
-        config: {
-          responseMimeType: 'application/json',
-        },
-      });
-      if (response && response.text) {
-        responseText = response.text;
+        });
+        if (response && response.text) {
+          responseText = response.text;
+          break;
+        }
+      } catch (e: any) {
+        lastErr = e;
+        const errMsg = String(e?.message || '');
+        if ((errMsg.includes('503') || errMsg.includes('429') || errMsg.includes('UNAVAILABLE')) && attempt === 0) {
+          await new Promise((res) => setTimeout(res, 800));
+          continue;
+        }
         break;
       }
-    } catch (e: any) {
-      lastErr = e;
+    }
+    if (responseText) {
+      break;
     }
   }
 
@@ -124,6 +250,9 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
     }>
   >([]);
   const [isStepReview, setIsStepReview] = useState(false);
+
+  const [engineMode, setEngineMode] = useState<'ocr' | 'gemini'>('ocr');
+  const [processingStatus, setProcessingStatus] = useState<string>('');
 
   const [manualApiKey, setManualApiKey] = useState<string>(() => {
     return localStorage.getItem('GEMINI_API_KEY') || localStorage.getItem('VITE_GEMINI_API_KEY') || '';
@@ -209,74 +338,89 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
 
     setIsProcessing(true);
     setErrorMessage(null);
+    setProcessingStatus('Starting screenshot analysis...');
 
     try {
-      // 1. Compress image to max 1600px & JPEG to ensure lightweight payload
-      const { base64, mimeType } = await compressImageForAI(imagePreviewUrl);
+      let extractedData: { monthName: string; items: ExtractedItem[] } | null = null;
 
-      let extractedData: any = null;
-      const effectiveApiKey = getEffectiveApiKey();
-
-      // 2. Post to backend/Cloudflare endpoint
-      try {
-        const response = await fetch('/api/parse-financial-screenshot', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            imageBase64: base64,
-            mimeType,
-          }),
+      if (engineMode === 'ocr') {
+        // Pure Local Client-Side OCR with Tesseract.js (Zero AI API key or server required)
+        extractedData = await extractFinancialDataWithOCR(imagePreviewUrl, (statusMsg) => {
+          setProcessingStatus(statusMsg);
         });
+      } else {
+        // Cloud AI or Server
+        setProcessingStatus('Compressing screenshot...');
+        const { base64, mimeType } = await compressImageForAI(imagePreviewUrl);
+        const effectiveApiKey = getEffectiveApiKey();
 
-        if (response.status === 405 || response.status === 404) {
-          if (effectiveApiKey) {
-            extractedData = await extractFinancialDataClientSide(base64, mimeType, effectiveApiKey);
+        try {
+          setProcessingStatus('Calling extraction server...');
+          const response = await fetch('/api/parse-financial-screenshot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              imageBase64: base64,
+              mimeType,
+            }),
+          });
+
+          if (response.status === 405 || response.status === 404) {
+            if (effectiveApiKey) {
+              setProcessingStatus('Processing with client-side Gemini AI...');
+              extractedData = await extractFinancialDataClientSide(base64, mimeType, effectiveApiKey);
+            } else {
+              setProcessingStatus('Server unavailable. Falling back to Local Browser OCR...');
+              extractedData = await extractFinancialDataWithOCR(imagePreviewUrl, (statusMsg) => {
+                setProcessingStatus(statusMsg);
+              });
+            }
           } else {
-            setShowKeyInput(true);
-            throw new Error(
-              "HTTP 405 (Method Not Allowed): Cloudflare Pages static hosting rejected the POST request to /api/parse-financial-screenshot.\n\n" +
-              "To fix this, either:\n" +
-              "1. Enter your Gemini API Key below to run extraction directly in your browser, OR\n" +
-              "2. Deploy the /functions folder to Cloudflare Pages and set GEMINI_API_KEY in Cloudflare Pages Settings."
-            );
-          }
-        } else {
-          const responseText = await response.text();
-          let resData: any = {};
-          try {
-            resData = responseText ? JSON.parse(responseText) : {};
-          } catch (_e) {
-            throw new Error(
-              `Server returned non-JSON response (HTTP ${response.status}): ${
-                responseText ? responseText.slice(0, 120) : 'Empty response received.'
-              }`
-            );
-          }
+            const responseText = await response.text();
+            let resData: any = {};
+            try {
+              resData = responseText ? JSON.parse(responseText) : {};
+            } catch (_e) {
+              throw new Error(
+                `Server returned non-JSON response (HTTP ${response.status})`
+              );
+            }
 
-          if (!response.ok || !resData.success) {
-            throw new Error(resData.error || resData.message || 'Failed to extract financial statement data.');
-          }
+            if (!response.ok || !resData.success) {
+              throw new Error(resData.error || resData.message || 'Failed to extract financial statement data.');
+            }
 
-          extractedData = resData.data;
-        }
-      } catch (backendErr: any) {
-        if (effectiveApiKey && !extractedData) {
-          try {
-            extractedData = await extractFinancialDataClientSide(base64, mimeType, effectiveApiKey);
-          } catch (clientErr: any) {
-            throw new Error(`${backendErr.message} (Client-side fallback error: ${clientErr.message})`);
+            extractedData = resData.data;
           }
-        } else {
-          throw backendErr;
+        } catch (serverErr: any) {
+          console.warn('AI Cloud extraction failed. Falling back to local OCR:', serverErr);
+          setProcessingStatus('Cloud AI unavailable. Falling back to Local Browser OCR...');
+          extractedData = await extractFinancialDataWithOCR(imagePreviewUrl, (statusMsg) => {
+            setProcessingStatus(statusMsg);
+          });
         }
       }
 
-      const { monthName, items } = extractedData || {};
+      if (!extractedData || !extractedData.items || extractedData.items.length === 0) {
+        if (engineMode === 'gemini') {
+          setProcessingStatus('Retrying with Local Browser OCR engine...');
+          extractedData = await extractFinancialDataWithOCR(imagePreviewUrl, (statusMsg) => {
+            setProcessingStatus(statusMsg);
+          });
+        }
+      }
+
+      const { monthName, items } = extractedData || { monthName: '', items: [] };
+
+      if (!items || items.length === 0) {
+        throw new Error(
+          'Could not detect table line items in the screenshot. Please ensure the screenshot clearly displays financial line items with Actual, Budget, or Last Year figures.'
+        );
+      }
 
       setExtractedMonthName(monthName || '');
       setExtractedItems(items || []);
 
-      // Attempt to auto-detect month index
       if (monthName) {
         const foundIdx = MONTH_NAMES.findIndex(
           (m) => m.toLowerCase() === monthName.trim().toLowerCase()
@@ -286,7 +430,6 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
         }
       }
 
-      // Perform matching between extracted items and system line items
       const mappings = mapExtractedItemsToSystem(items || [], yearData);
       setMatchedMapping(mappings);
       setIsStepReview(true);
@@ -295,6 +438,7 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
       setErrorMessage(err.message || 'An unexpected error occurred while parsing the image.');
     } finally {
       setIsProcessing(false);
+      setProcessingStatus('');
     }
   };
 
@@ -406,6 +550,57 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
           {!isStepReview ? (
             /* STEP 1: UPLOAD SCREENSHOT */
             <div className="space-y-5">
+              {/* Extraction Engine Selector */}
+              <div className="bg-zinc-100 p-3 border border-zinc-200 rounded-none space-y-2">
+                <div className="text-[11px] font-black text-zinc-700 uppercase tracking-wider flex items-center justify-between">
+                  <span>Extraction Engine</span>
+                  <span className="text-zinc-500 font-semibold normal-case">
+                    {engineMode === 'ocr'
+                      ? '⚡ Pure Client-Side Local OCR (No API Key or Server Needed)'
+                      : '🤖 Gemini Vision AI'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEngineMode('ocr');
+                      setErrorMessage(null);
+                    }}
+                    className={`px-3 py-2 text-xs font-bold border transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                      engineMode === 'ocr'
+                        ? 'bg-black text-white border-black shadow-xs'
+                        : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50'
+                    }`}
+                  >
+                    <Zap className="w-4 h-4 text-amber-400 fill-amber-400" />
+                    <span>Local Browser OCR (No AI)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEngineMode('gemini');
+                      setErrorMessage(null);
+                    }}
+                    className={`px-3 py-2 text-xs font-bold border transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                      engineMode === 'gemini'
+                        ? 'bg-black text-white border-black shadow-xs'
+                        : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50'
+                    }`}
+                  >
+                    <Sparkles className="w-4 h-4 text-sky-400" />
+                    <span>Gemini Vision AI</span>
+                  </button>
+                </div>
+              </div>
+
+              {isProcessing && processingStatus && (
+                <div className="bg-zinc-900 text-white p-3 border border-zinc-800 text-xs font-mono flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin text-amber-400 flex-shrink-0" />
+                  <span>{processingStatus}</span>
+                </div>
+              )}
+
               <div
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={handleDrop}
@@ -474,12 +669,12 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
               <div className="bg-zinc-50 border border-zinc-200 rounded-none p-4 text-xs text-zinc-600 space-y-1">
                 <p className="font-black text-black flex items-center gap-1.5">
                   <Bot className="w-4 h-4 text-black" />
-                  How AI Auto-Fill Works:
+                  How Auto-Fill Works:
                 </p>
                 <ul className="list-disc list-inside space-y-1 text-zinc-600 font-medium pl-1">
-                  <li>AI Vision reads table headers, row titles, and numerical values for Actual, Budget, and Last Year.</li>
-                  <li>Automatically detects the month (e.g. July) or allows you to pick target month.</li>
-                  <li>Maps each line item to the department ledger structure and populates figures in one click.</li>
+                  <li>Reads screenshot text locally using high-precision optical character recognition (OCR) or Gemini AI.</li>
+                  <li>Extracts line items and figures for Actual, Budget, and Last Year columns.</li>
+                  <li>Auto-detects the month (e.g., July) and matches figures to department ledger line items.</li>
                 </ul>
               </div>
             </div>
@@ -600,12 +795,17 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
                 {isProcessing ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin text-white" />
-                    <span>Extracting with AI...</span>
+                    <span>Processing Image...</span>
+                  </>
+                ) : engineMode === 'ocr' ? (
+                  <>
+                    <Zap className="w-4 h-4 text-amber-400 fill-amber-400" />
+                    <span>Extract Figures with Local OCR</span>
                   </>
                 ) : (
                   <>
-                    <Sparkles className="w-4 h-4 text-white" />
-                    <span>Extract & Process Screenshot</span>
+                    <Sparkles className="w-4 h-4 text-sky-400" />
+                    <span>Extract Figures with Gemini AI</span>
                   </>
                 )}
               </button>

@@ -161,73 +161,95 @@ Note:
 - If a value is 0, blank, or missing, set it to 0.
 - Extract individual expense line items accurately (e.g., Salaries & Wages, Cost of Cell Phones, Dues and Subscriptions, etc.).`;
 
-      // Supported valid Gemini API model names according to official SDK specifications
-      const modelsToTry = ["gemini-3.6-flash", "gemini-flash-latest"];
+      // Supported Gemini API model names with automatic fallback order
+      const modelsToTry = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-flash-latest",
+        "gemini-3.6-flash",
+        "gemini-2.5-pro",
+      ];
       let response: any = null;
       let lastModelError: any = null;
 
       for (const modelName of modelsToTry) {
-        try {
-          response = await ai.models.generateContent({
-            model: modelName,
-            contents: [
-              {
-                inlineData: {
-                  mimeType: mimeType || "image/jpeg",
-                  data: cleanBase64,
-                },
-              },
-              {
-                text: promptText,
-              },
-            ],
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  monthName: {
-                    type: Type.STRING,
-                    description: "Name of the month if visible in table headers",
+        // Try up to 2 times per model if hit with temporary 503 (UNAVAILABLE) or 429 (RATE_LIMIT)
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            response = await ai.models.generateContent({
+              model: modelName,
+              contents: [
+                {
+                  inlineData: {
+                    mimeType: mimeType || "image/jpeg",
+                    data: cleanBase64,
                   },
-                  items: {
-                    type: Type.ARRAY,
-                    description: "List of extracted financial line items",
+                },
+                {
+                  text: promptText,
+                },
+              ],
+              config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    monthName: {
+                      type: Type.STRING,
+                      description: "Name of the month if visible in table headers",
+                    },
                     items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        lineItemName: {
-                          type: Type.STRING,
-                          description: "Exact or raw line item label",
+                      type: Type.ARRAY,
+                      description: "List of extracted financial line items",
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          lineItemName: {
+                            type: Type.STRING,
+                            description: "Exact or raw line item label",
+                          },
+                          actual: {
+                            type: Type.NUMBER,
+                            description: "Actual dollar amount",
+                          },
+                          budget: {
+                            type: Type.NUMBER,
+                            description: "Budget dollar amount",
+                          },
+                          lastYear: {
+                            type: Type.NUMBER,
+                            description: "Last Year dollar amount",
+                          },
                         },
-                        actual: {
-                          type: Type.NUMBER,
-                          description: "Actual dollar amount",
-                        },
-                        budget: {
-                          type: Type.NUMBER,
-                          description: "Budget dollar amount",
-                        },
-                        lastYear: {
-                          type: Type.NUMBER,
-                          description: "Last Year dollar amount",
-                        },
+                        required: ["lineItemName", "actual", "budget", "lastYear"],
                       },
-                      required: ["lineItemName", "actual", "budget", "lastYear"],
                     },
                   },
+                  required: ["monthName", "items"],
                 },
-                required: ["monthName", "items"],
               },
-            },
-          });
-          if (response && response.text) {
-            console.log(`Successfully extracted data using model ${modelName}`);
-            break;
+            });
+
+            if (response && response.text) {
+              console.log(`Successfully extracted data using model ${modelName}`);
+              break;
+            }
+          } catch (mErr: any) {
+            console.warn(`Gemini model ${modelName} (attempt ${attempt + 1}) failed:`, mErr?.message || mErr);
+            lastModelError = mErr;
+
+            const errMsg = String(mErr?.message || '');
+            if ((errMsg.includes('503') || errMsg.includes('429') || errMsg.includes('UNAVAILABLE')) && attempt === 0) {
+              // Wait 800ms before retrying the same model
+              await new Promise((resolve) => setTimeout(resolve, 800));
+              continue;
+            }
+            break; // Move to next model in array
           }
-        } catch (mErr: any) {
-          console.warn(`Gemini model ${modelName} failed:`, mErr?.message || mErr);
-          lastModelError = mErr;
+        }
+        if (response && response.text) {
+          break;
         }
       }
 

@@ -65,41 +65,52 @@ Return strictly valid JSON with format:
   ]
 }`;
 
-    // Models supported on Gemini v1beta REST API
-    const modelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"];
+    // Models supported on Gemini v1beta REST API with fallback order
+    const modelsToTry = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest", "gemini-3.6-flash", "gemini-2.5-pro"];
     let geminiResponse = null;
     let lastErrorMsg = "";
 
     for (const model of modelsToTry) {
       const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      try {
-        const res = await fetch(geminiUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  { inline_data: { mime_type: mimeType, data: cleanBase64 } },
-                  { text: promptText },
-                ],
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const res = await fetch(geminiUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [
+                {
+                  parts: [
+                    { inline_data: { mime_type: mimeType, data: cleanBase64 } },
+                    { text: promptText },
+                  ],
+                },
+              ],
+              generationConfig: {
+                response_mime_type: "application/json",
               },
-            ],
-            generationConfig: {
-              response_mime_type: "application/json",
-            },
-          }),
-        });
+            }),
+          });
 
-        if (res.ok) {
-          geminiResponse = await res.json();
+          if (res.ok) {
+            geminiResponse = await res.json();
+            break;
+          } else {
+            const errData = await res.json().catch(() => ({}));
+            lastErrorMsg = errData?.error?.message || `HTTP ${res.status}`;
+            if ((res.status === 503 || res.status === 429 || lastErrorMsg.includes("UNAVAILABLE")) && attempt === 0) {
+              await new Promise((r) => setTimeout(r, 800));
+              continue;
+            }
+            break;
+          }
+        } catch (err) {
+          lastErrorMsg = err.message;
           break;
-        } else {
-          const errData = await res.json().catch(() => ({}));
-          lastErrorMsg = errData?.error?.message || `HTTP ${res.status}`;
         }
-      } catch (err) {
-        lastErrorMsg = err.message;
+      }
+      if (geminiResponse) {
+        break;
       }
     }
 
