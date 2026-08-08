@@ -1,7 +1,32 @@
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Content-Type": "application/json",
+};
+
+export async function onRequestOptions() {
+  return new Response(null, {
+    status: 204,
+    headers: CORS_HEADERS,
+  });
+}
+
+export async function onRequest(context) {
+  if (context.request.method === "OPTIONS") {
+    return onRequestOptions();
+  }
+  return onRequestPost(context);
+}
+
 export async function onRequestPost(context) {
   try {
     const { request, env } = context;
-    const body = await request.json();
+    if (request.method === "OPTIONS") {
+      return onRequestOptions();
+    }
+
+    const body = await request.json().catch(() => ({}));
     const apiKey = env.GEMINI_API_KEY || env.VITE_GEMINI_API_KEY;
 
     if (!apiKey) {
@@ -10,7 +35,7 @@ export async function onRequestPost(context) {
           success: false,
           error: "GEMINI_API_KEY environment variable is not configured in Cloudflare Pages settings.",
         }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
+        { status: 500, headers: CORS_HEADERS }
       );
     }
 
@@ -40,8 +65,8 @@ Return strictly valid JSON with format:
   ]
 }`;
 
-    // Try primary models supported on Gemini v1beta REST API
-    const modelsToTry = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+    // Models supported on Gemini v1beta REST API
+    const modelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"];
     let geminiResponse = null;
     let lastErrorMsg = "";
 
@@ -84,7 +109,7 @@ Return strictly valid JSON with format:
           success: false,
           error: `Gemini API call failed on Cloudflare: ${lastErrorMsg}`,
         }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
+        { status: 500, headers: CORS_HEADERS }
       );
     }
 
@@ -105,13 +130,13 @@ Return strictly valid JSON with format:
       }),
       {
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: CORS_HEADERS,
       }
     );
   } catch (err) {
     return new Response(
       JSON.stringify({ success: false, error: err.message }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
+      { status: 500, headers: CORS_HEADERS }
     );
   }
 }
