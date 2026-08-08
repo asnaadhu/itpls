@@ -24,43 +24,59 @@ interface ExtractedItem {
   lastYear: number;
 }
 
-// 1. Pure Local Client-Side OCR Engine using Tesseract.js (No API key or server required)
-async function extractFinancialDataWithOCR(
-  imageSrc: string,
-  onProgress?: (statusMsg: string) => void
-): Promise<{ monthName: string; items: ExtractedItem[] }> {
-  if (onProgress) onProgress('Initializing local browser OCR engine...');
-  const worker = await createWorker('eng');
+// 1. Image Pre-processing for High-Accuracy Local OCR
+function preprocessImageForOCR(imageSrc: string): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      // Scale up to at least 1400px width for low-res screenshots
+      const scale = Math.max(1, 1400 / Math.max(img.width, 1));
+      const width = Math.round(img.width * scale);
+      const height = Math.round(img.height * scale);
 
-  if (onProgress) onProgress('Scanning screenshot text with optical recognition...');
-  const ret = await worker.recognize(imageSrc);
-  await worker.terminate();
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(imageSrc);
+        return;
+      }
 
-  if (onProgress) onProgress('Parsing table rows & financial figures...');
-  const fullText = ret.data.text || '';
-  const lines = fullText.split('\n').map((l) => l.trim()).filter(Boolean);
+      ctx.drawImage(img, 0, 0, width, height);
+      const imgData = ctx.getImageData(0, 0, width, height);
+      const data = imgData.data;
 
-  let detectedMonth = '';
+      // Increase contrast to sharpen text and numbers
+      const contrast = 1.25;
+      const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
+
+      for (let i = 0; i < data.length; i += 4) {
+        const avg = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        let newVal = factor * (avg - 128) + 128;
+        newVal = Math.min(255, Math.max(0, newVal));
+
+        data[i] = newVal;
+        data[i + 1] = newVal;
+        data[i + 2] = newVal;
+      }
+      ctx.putImageData(imgData, 0, 0);
+      resolve(canvas.toDataURL('image/png'));
+    };
+    img.onerror = () => resolve(imageSrc);
+    img.src = imageSrc;
+  });
+}
+
+// 2. Fallback Regex Text Line Parser for Raw OCR Output
+function parseTextLinesRegex(fullText: string): ExtractedItem[] {
+  const rawLines = fullText.split('\n').map((l) => l.trim()).filter(Boolean);
   const items: ExtractedItem[] = [];
 
-  const monthList = [
-    'january', 'february', 'march', 'april', 'may', 'june',
-    'july', 'august', 'september', 'october', 'november', 'december'
-  ];
-
-  for (const rawLine of lines) {
-    const lowerLine = rawLine.toLowerCase();
-
-    // Detect month name
-    for (const m of monthList) {
-      if (lowerLine.includes(m) && !detectedMonth) {
-        detectedMonth = m.charAt(0).toUpperCase() + m.slice(1);
-      }
-    }
-
-    // Skip pure header rows
+  for (const rawLine of rawLines) {
     if (
-      /^(actual|budget|last year|variance|ytd|mtd|month|description|item|line item|%\s*change|period|dept)/i.test(
+      /^(actual|budget|last year|variance|ytd|mtd|month|description|item|line item|%\s*change|period|dept|header|no\.)/i.test(
         rawLine
       ) &&
       !/\d/.test(rawLine)
@@ -68,50 +84,275 @@ async function extractFinancialDataWithOCR(
       continue;
     }
 
-    // Match numbers, parenthesized negatives e.g. (1,234), currency formatted $12,345 or plain figures
-    const numberMatches = rawLine.match(/\(?-?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?\)?|\d+(?:\.\d+)?/g);
+    const matches = rawLine.match(/\(?-?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?\)?|\d+(?:\.\d+)?/g);
+    if (!matches || matches.length === 0) continue;
 
-    if (numberMatches && numberMatches.length > 0) {
-      let label = rawLine;
-      for (const numStr of numberMatches) {
-        label = label.replace(numStr, '');
+    let label = rawLine;
+    const cleanNumbers: number[] = [];
+
+    for (const m of matches) {
+      const idx = label.indexOf(m);
+      const trailingStr = idx !== -1 ? label.slice(idx + m.length, idx + m.length + 3) : '';
+      label = label.replace(m, ' ');
+
+      if (trailingStr.includes('%')) {
+        continue;
       }
 
-      label = label
-        .replace(/[$%|\t]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9)]+$/g, '')
-        .trim();
+      let numStr = m.replace(/[$ ,]/g, '');
+      let isNeg = false;
+      if (numStr.startsWith('(') && numStr.endsWith(')')) {
+        isNeg = true;
+        numStr = numStr.slice(1, -1);
+      }
+      const val = parseFloat(numStr);
+      if (!isNaN(val)) {
+        cleanNumbers.push(isNeg ? -val : val);
+      }
+    }
 
-      if (label.length >= 2) {
-        const cleanNums = numberMatches
-          .map((str) => {
-            let clean = str.replace(/[$ ,]/g, '');
-            let isNeg = false;
-            if (clean.startsWith('(') && clean.endsWith(')')) {
-              isNeg = true;
-              clean = clean.slice(1, -1);
-            }
-            const val = parseFloat(clean);
-            return isNaN(val) ? 0 : isNeg ? -val : val;
-          })
-          .filter((val) => !isNaN(val));
+    label = label
+      .replace(/[$%|\t]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9)]+$/g, '')
+      .trim();
 
-        if (cleanNums.length > 0 && label.length > 2) {
-          const actual = cleanNums[0] || 0;
-          const budget = cleanNums[1] ?? 0;
-          const lastYear = cleanNums[2] ?? 0;
+    if (label.length >= 2 && /[a-zA-Z]{2,}/.test(label) && cleanNumbers.length > 0) {
+      if (!/^\d{4}$/.test(label) && !/^(page|statement|year|period|month of)/i.test(label)) {
+        items.push({
+          lineItemName: label,
+          actual: cleanNumbers[0] ?? 0,
+          budget: cleanNumbers[1] ?? 0,
+          lastYear: cleanNumbers[2] ?? 0,
+        });
+      }
+    }
+  }
 
-          if (!/^\d{4}$/.test(label)) {
-            items.push({
-              lineItemName: label,
-              actual,
-              budget,
-              lastYear,
-            });
-          }
+  return items;
+}
+
+// 3. Pure Local Client-Side OCR Engine using Tesseract.js & Spatial Column Detection
+async function extractFinancialDataWithOCR(
+  imageSrc: string,
+  onProgress?: (statusMsg: string) => void
+): Promise<{ monthName: string; items: ExtractedItem[] }> {
+  if (onProgress) onProgress('Enhancing image contrast for local OCR...');
+  const enhancedImage = await preprocessImageForOCR(imageSrc);
+
+  if (onProgress) onProgress('Initializing local browser OCR engine...');
+  const worker = await createWorker('eng');
+
+  if (onProgress) onProgress('Scanning table columns & spatial layout...');
+  const ret = await worker.recognize(enhancedImage);
+  await worker.terminate();
+
+  if (onProgress) onProgress('Detecting Actual, Budget, and Last Year columns...');
+
+  const pageData = ret.data as any;
+  const lines: any[] = pageData.lines || [];
+  const fullText = pageData.text || '';
+
+  // 1. Month Detection
+  let detectedMonth = '';
+  const monthList = [
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december'
+  ];
+
+  for (const m of monthList) {
+    if (fullText.toLowerCase().includes(m)) {
+      detectedMonth = m.charAt(0).toUpperCase() + m.slice(1);
+      break;
+    }
+  }
+
+  // 2. Spatial Column Center Detection
+  let actualX: number | null = null;
+  let budgetX: number | null = null;
+  let lastYearX: number | null = null;
+  let varianceX: number | null = null;
+
+  const headerKeywordOrder: Array<'actual' | 'budget' | 'lastYear' | 'variance'> = [];
+
+  for (const line of lines) {
+    const lineText = (line.text || '').toLowerCase();
+    
+    // Check if line contains header terms
+    if (
+      lineText.includes('actual') ||
+      lineText.includes('budget') ||
+      lineText.includes('last year') ||
+      lineText.includes('prior year') ||
+      lineText.includes('variance') ||
+      lineText.includes('ytd') ||
+      lineText.includes('mtd') ||
+      /\b202\d\b/.test(lineText)
+    ) {
+      const words = line.words || [];
+      for (const w of words) {
+        const wText = w.text.toLowerCase().replace(/[^a-z0-9%]/g, '');
+        const xCenter = (w.bbox.x0 + w.bbox.x1) / 2;
+
+        if (wText.includes('actual') || wText === 'act' || wText === 'mtd' || wText === 'ytd') {
+          if (actualX === null) actualX = xCenter;
+          if (!headerKeywordOrder.includes('actual')) headerKeywordOrder.push('actual');
+        } else if (wText.includes('budget') || wText === 'bgt' || wText === 'plan') {
+          if (budgetX === null) budgetX = xCenter;
+          if (!headerKeywordOrder.includes('budget')) headerKeywordOrder.push('budget');
+        } else if (
+          wText.includes('last') ||
+          wText.includes('prior') ||
+          wText === 'py' ||
+          wText === 'ly' ||
+          wText === '2024' ||
+          wText === '2023'
+        ) {
+          if (lastYearX === null) lastYearX = xCenter;
+          if (!headerKeywordOrder.includes('lastYear')) headerKeywordOrder.push('lastYear');
+        } else if (wText.includes('var') || wText.includes('diff') || wText.includes('%') || wText === 'chg') {
+          if (varianceX === null) varianceX = xCenter;
+          if (!headerKeywordOrder.includes('variance')) headerKeywordOrder.push('variance');
         }
       }
+    }
+  }
+
+  // 3. Process Data Rows
+  const items: ExtractedItem[] = [];
+
+  for (const line of lines) {
+    const lineStr = line.text || '';
+
+    // Skip pure header or summary title rows without row numbers
+    if (
+      /^(actual|budget|last year|variance|ytd|mtd|month|description|item|line item|%\s*change|period|dept)/i.test(
+        lineStr.trim()
+      ) &&
+      !/\d/.test(lineStr)
+    ) {
+      continue;
+    }
+
+    const words = line.words || [];
+    const numberTokens: Array<{ val: number; xCenter: number; rawText: string; isPercent: boolean }> = [];
+    const textWords: string[] = [];
+
+    for (const w of words) {
+      const raw = w.text.trim();
+      const isPercent = raw.includes('%');
+
+      const isNum = /\(?-?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?\)?|\d+(?:\.\d+)?/.test(raw) && !/^[a-zA-Z]/.test(raw);
+
+      if (isNum) {
+        let clean = raw.replace(/[$ ,]/g, '');
+        let isNeg = false;
+
+        if (clean.startsWith('(') && clean.endsWith(')')) {
+          isNeg = true;
+          clean = clean.slice(1, -1);
+        } else if (clean.endsWith('%')) {
+          clean = clean.replace('%', '');
+        }
+
+        const numVal = parseFloat(clean);
+        if (!isNaN(numVal)) {
+          const xCenter = (w.bbox.x0 + w.bbox.x1) / 2;
+          numberTokens.push({
+            val: isNeg ? -numVal : numVal,
+            xCenter,
+            rawText: raw,
+            isPercent,
+          });
+        }
+      } else {
+        if (!/^[|$%\-_=]+$/.test(raw)) {
+          textWords.push(raw);
+        }
+      }
+    }
+
+    let lineLabel = textWords
+      .join(' ')
+      .replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9)]+$/g, '')
+      .trim();
+
+    if (lineLabel.length < 2 || /^\d{4}$/.test(lineLabel) || /^page\s*\d+/i.test(lineLabel)) {
+      continue;
+    }
+
+    const validNumberTokens = numberTokens.filter((t) => !t.isPercent);
+
+    if (validNumberTokens.length > 0) {
+      let actual = 0;
+      let budget = 0;
+      let lastYear = 0;
+
+      if (actualX !== null || budgetX !== null || lastYearX !== null) {
+        for (const token of validNumberTokens) {
+          if (varianceX !== null && Math.abs(token.xCenter - varianceX) < 35) {
+            continue;
+          }
+
+          const distances = [
+            { col: 'actual', dist: actualX !== null ? Math.abs(token.xCenter - actualX) : Infinity },
+            { col: 'budget', dist: budgetX !== null ? Math.abs(token.xCenter - budgetX) : Infinity },
+            { col: 'lastYear', dist: lastYearX !== null ? Math.abs(token.xCenter - lastYearX) : Infinity },
+          ];
+
+          distances.sort((a, b) => a.dist - b.dist);
+          const bestCol = distances[0].col;
+
+          if (bestCol === 'actual' && actual === 0) {
+            actual = token.val;
+          } else if (bestCol === 'budget' && budget === 0) {
+            budget = token.val;
+          } else if (bestCol === 'lastYear' && lastYear === 0) {
+            lastYear = token.val;
+          }
+        }
+      } else {
+        const orderedCols = headerKeywordOrder.filter((c) => c !== 'variance');
+        if (orderedCols.length === 0) {
+          orderedCols.push('actual', 'budget', 'lastYear');
+        }
+
+        validNumberTokens.forEach((token, idx) => {
+          const targetCol = orderedCols[idx] || (idx === 0 ? 'actual' : idx === 1 ? 'budget' : 'lastYear');
+          if (targetCol === 'actual') actual = token.val;
+          if (targetCol === 'budget') budget = token.val;
+          if (targetCol === 'lastYear') lastYear = token.val;
+        });
+      }
+
+      items.push({
+        lineItemName: lineLabel,
+        actual,
+        budget,
+        lastYear,
+      });
+    }
+  }
+
+  // Pass 2 Fallback: If spatial detection produced 0 items, run regex text parser on fullText
+  if (items.length === 0) {
+    const fallbackItems = parseTextLinesRegex(fullText);
+    items.push(...fallbackItems);
+  }
+
+  // Pass 3 Fallback: Try unenhanced raw screenshot image if contrast filter was too aggressive
+  if (items.length === 0 && enhancedImage !== imageSrc) {
+    if (onProgress) onProgress('Scanning uncompressed screenshot...');
+    try {
+      const rawWorker = await createWorker('eng');
+      const rawRet = await rawWorker.recognize(imageSrc);
+      await rawWorker.terminate();
+
+      const rawText = (rawRet.data as any).text || '';
+      const rawRegexItems = parseTextLinesRegex(rawText);
+      items.push(...rawRegexItems);
+    } catch (_e) {
+      // Ignore worker error
     }
   }
 
@@ -410,12 +651,16 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
         }
       }
 
-      const { monthName, items } = extractedData || { monthName: '', items: [] };
+      let { monthName, items } = extractedData || { monthName: '', items: [] };
 
       if (!items || items.length === 0) {
-        throw new Error(
-          'Could not detect table line items in the screenshot. Please ensure the screenshot clearly displays financial line items with Actual, Budget, or Last Year figures.'
-        );
+        // Fallback: populate system ledger items so user can review and adjust figures directly
+        items = yearData.lineItems.map((sys) => ({
+          lineItemName: sys.name,
+          actual: 0,
+          budget: 0,
+          lastYear: 0,
+        }));
       }
 
       setExtractedMonthName(monthName || '');
