@@ -161,7 +161,7 @@ Note:
 - If a value is 0, blank, or missing, set it to 0.
 - Extract individual expense line items accurately (e.g., Salaries & Wages, Cost of Cell Phones, Dues and Subscriptions, etc.).`;
 
-      // Supported valid Gemini API model names according to @google/genai SDK specs
+      // Supported valid Gemini API model names according to official SDK specifications
       const modelsToTry = ["gemini-3.6-flash", "gemini-flash-latest"];
       let response: any = null;
       let lastModelError: any = null;
@@ -221,7 +221,8 @@ Note:
               },
             },
           });
-          if (response) {
+          if (response && response.text) {
+            console.log(`Successfully extracted data using model ${modelName}`);
             break;
           }
         } catch (mErr: any) {
@@ -230,11 +231,17 @@ Note:
         }
       }
 
-      if (!response) {
-        const errMsg = lastModelError?.message || "Gemini API call failed";
+      if (!response || !response.text) {
+        const rawErrStr = lastModelError?.message || JSON.stringify(lastModelError) || "Gemini API call failed";
+        const isQuota = rawErrStr.includes("429") || rawErrStr.includes("RESOURCE_EXHAUSTED") || rawErrStr.includes("Quota");
+        
+        const friendlyMessage = isQuota
+          ? "Gemini API quota rate-limit reached. Please wait ~10 seconds and click 'Extract & Process Screenshot' again."
+          : `AI extraction failed: ${rawErrStr}. Please verify GEMINI_API_KEY in Settings.`;
+
         return res.status(500).json({
           success: false,
-          error: `AI extraction error: ${errMsg}. Please check that your Gemini API key is valid in Settings.`
+          error: friendlyMessage
         });
       }
 
