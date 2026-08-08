@@ -148,6 +148,13 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
       // 3. Safely read text first to prevent JSON.parse crashes on empty/HTML error bodies
       const responseText = await response.text();
       let resData: any = {};
+
+      if (response.status === 405) {
+        throw new Error(
+          "HTTP 405 (Method Not Allowed): Your hosting provider (e.g. Cloudflare Pages static hosting) rejects POST requests to static routes. To run API endpoints like Gemini AI, you must host this app using Node.js (Express server.ts) or set up a Cloudflare Pages Function at /functions/api/parse-financial-screenshot.js."
+        );
+      }
+
       try {
         resData = responseText ? JSON.parse(responseText) : {};
       } catch (_e) {
