@@ -125,7 +125,22 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
   >([]);
   const [isStepReview, setIsStepReview] = useState(false);
 
+  const [manualApiKey, setManualApiKey] = useState<string>(() => {
+    return localStorage.getItem('GEMINI_API_KEY') || localStorage.getItem('VITE_GEMINI_API_KEY') || '';
+  });
+  const [showKeyInput, setShowKeyInput] = useState<boolean>(false);
+
   if (!isOpen) return null;
+
+  const getEffectiveApiKey = () => {
+    return (
+      manualApiKey.trim() ||
+      localStorage.getItem('GEMINI_API_KEY') ||
+      localStorage.getItem('VITE_GEMINI_API_KEY') ||
+      (import.meta as any).env?.VITE_GEMINI_API_KEY ||
+      ''
+    );
+  };
 
   const handleFileChange = (file: File) => {
     if (!file.type.startsWith('image/')) {
@@ -200,7 +215,7 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
       const { base64, mimeType } = await compressImageForAI(imagePreviewUrl);
 
       let extractedData: any = null;
-      const viteApiKey = (import.meta as any).env?.VITE_GEMINI_API_KEY;
+      const effectiveApiKey = getEffectiveApiKey();
 
       // 2. Post to backend/Cloudflare endpoint
       try {
@@ -214,15 +229,15 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
         });
 
         if (response.status === 405 || response.status === 404) {
-          if (viteApiKey) {
-            extractedData = await extractFinancialDataClientSide(base64, mimeType, viteApiKey);
+          if (effectiveApiKey) {
+            extractedData = await extractFinancialDataClientSide(base64, mimeType, effectiveApiKey);
           } else {
+            setShowKeyInput(true);
             throw new Error(
-              "HTTP 405 (Method Not Allowed): Cloudflare Pages static hosting received a POST request to /api/parse-financial-screenshot.\n\n" +
-              "To fix this on Cloudflare Pages:\n" +
-              "1. Make sure you push the /functions folder to your repository.\n" +
-              "2. In Cloudflare Pages Settings -> Environment Variables, add 'GEMINI_API_KEY' (or 'VITE_GEMINI_API_KEY').\n" +
-              "3. Re-deploy your site on Cloudflare Pages so the Cloudflare Function is registered."
+              "HTTP 405 (Method Not Allowed): Cloudflare Pages static hosting rejected the POST request to /api/parse-financial-screenshot.\n\n" +
+              "To fix this, either:\n" +
+              "1. Enter your Gemini API Key below to run extraction directly in your browser, OR\n" +
+              "2. Deploy the /functions folder to Cloudflare Pages and set GEMINI_API_KEY in Cloudflare Pages Settings."
             );
           }
         } else {
@@ -245,9 +260,9 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
           extractedData = resData.data;
         }
       } catch (backendErr: any) {
-        if (viteApiKey && !extractedData) {
+        if (effectiveApiKey && !extractedData) {
           try {
-            extractedData = await extractFinancialDataClientSide(base64, mimeType, viteApiKey);
+            extractedData = await extractFinancialDataClientSide(base64, mimeType, effectiveApiKey);
           } catch (clientErr: any) {
             throw new Error(`${backendErr.message} (Client-side fallback error: ${clientErr.message})`);
           }
@@ -345,9 +360,46 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
         {/* Content Body */}
         <div className="p-6 overflow-y-auto flex-1 space-y-6">
           {errorMessage && (
-            <div className="bg-rose-50 border border-rose-200 text-rose-800 p-4 rounded-none text-xs font-bold flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-rose-600 flex-shrink-0" />
-              <span>{errorMessage}</span>
+            <div className="bg-rose-50 border border-rose-200 text-rose-900 p-4 rounded-none text-xs flex flex-col gap-3">
+              <div className="flex items-start gap-2 font-bold">
+                <AlertCircle className="w-4 h-4 text-rose-600 flex-shrink-0 mt-0.5" />
+                <span className="whitespace-pre-line">{errorMessage}</span>
+              </div>
+
+              {(showKeyInput || errorMessage.includes('405')) && (
+                <div className="mt-2 p-3 bg-white border border-rose-300 rounded-none space-y-2">
+                  <label className="block text-xs font-black text-zinc-900">
+                    🔑 Enter Gemini API Key for Browser-Based Extraction:
+                  </label>
+                  <p className="text-[11px] text-zinc-600">
+                    Since your hosting server rejects POST requests, enter a free Gemini API key to run AI extraction directly in your browser.
+                  </p>
+                  <div className="flex gap-2">
+                    <input
+                      type="password"
+                      placeholder="AIzaSy..."
+                      value={manualApiKey}
+                      onChange={(e) => setManualApiKey(e.target.value)}
+                      className="flex-1 border border-zinc-300 px-3 py-1.5 text-xs focus:border-black focus:outline-none bg-zinc-50"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (manualApiKey.trim()) {
+                          localStorage.setItem('GEMINI_API_KEY', manualApiKey.trim());
+                          localStorage.setItem('VITE_GEMINI_API_KEY', manualApiKey.trim());
+                          setErrorMessage(null);
+                          setShowKeyInput(false);
+                          handleProcessImage();
+                        }
+                      }}
+                      className="bg-black hover:bg-zinc-800 text-white font-bold px-4 py-1.5 text-xs transition-all cursor-pointer whitespace-nowrap"
+                    >
+                      Save Key & Retry
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
