@@ -1,0 +1,6 @@
+{
+  "name": "YTD Expense Tracker & Visualizer",
+  "description": "Year-To-Date financial expense tracking app with automatic YTD aggregation, budget vs actual variance analysis, and interactive visualizations based on Information & Telecommunication Systems reporting structure.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
