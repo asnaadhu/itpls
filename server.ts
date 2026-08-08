@@ -161,8 +161,8 @@ Note:
 - If a value is 0, blank, or missing, set it to 0.
 - Extract individual expense line items accurately (e.g., Salaries & Wages, Cost of Cell Phones, Dues and Subscriptions, etc.).`;
 
-      // Supported Gemini API model names in order of preference
-      const modelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"];
+      // Supported valid Gemini API model names according to @google/genai SDK specs
+      const modelsToTry = ["gemini-3.6-flash", "gemini-flash-latest"];
       let response: any = null;
       let lastModelError: any = null;
 
@@ -231,9 +231,11 @@ Note:
       }
 
       if (!response) {
-        throw new Error(
-          lastModelError?.message || "All Gemini API models failed to process the screenshot."
-        );
+        const errMsg = lastModelError?.message || "Gemini API call failed";
+        return res.status(500).json({
+          success: false,
+          error: `AI extraction error: ${errMsg}. Please check that your Gemini API key is valid in Settings.`
+        });
       }
 
       const responseText = response.text || "{}";

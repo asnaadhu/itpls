@@ -14,6 +14,7 @@ import { QuickDataEntry } from './components/QuickDataEntry';
 import { LoginPage } from './components/LoginPage';
 import { ScreenshotUploadModal } from './components/ScreenshotUploadModal';
 import { SettingsModal } from './components/SettingsModal';
+import { InactivityModal } from './components/InactivityModal';
 import { Sidebar } from './components/Sidebar';
 import { Visualizations } from './components/Visualizations';
 import { DEFAULT_USERS } from './data/defaultUsers';
@@ -51,7 +52,82 @@ export default function App() {
     return DEFAULT_USERS;
   });
 
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(() => {
+    try {
+      const saved = localStorage.getItem(AUTH_USER_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && parsed.id) return parsed;
+      }
+    } catch (e) {
+      console.error('Failed to restore user session:', e);
+    }
+    return null;
+  });
+
+  // Inactivity Auto-Logout State & Timer (5 Minutes Total = 300s)
+  const lastActivityTimeRef = React.useRef<number>(Date.now());
+  const [isIdleWarningOpen, setIsIdleWarningOpen] = useState<boolean>(false);
+  const [idleSecondsRemaining, setIdleSecondsRemaining] = useState<number>(30);
+
+  const handleResetInactivityTimer = () => {
+    lastActivityTimeRef.current = Date.now();
+    setIsIdleWarningOpen(false);
+    setIdleSecondsRemaining(30);
+  };
+
+  useEffect(() => {
+    if (!currentUser) {
+      setIsIdleWarningOpen(false);
+      return;
+    }
+
+    lastActivityTimeRef.current = Date.now();
+
+    const activityEvents = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll', 'pointerdown'];
+
+    const handleUserActivity = () => {
+      // Keep updating lastActivityTime if warning prompt is not shown
+      if (!isIdleWarningOpen) {
+        lastActivityTimeRef.current = Date.now();
+      }
+    };
+
+    activityEvents.forEach((evt) => {
+      window.addEventListener(evt, handleUserActivity, { passive: true });
+    });
+
+    const interval = setInterval(() => {
+      const elapsedMs = Date.now() - lastActivityTimeRef.current;
+      const idleSec = Math.floor(elapsedMs / 1000);
+
+      if (idleSec >= 300) {
+        // 5 Minutes (300s) of inactivity reached -> Logout!
+        setIsIdleWarningOpen(false);
+        addAuditLog(
+          'INACTIVITY_LOGOUT',
+          `User session automatically terminated due to 5 minutes of inactivity.`,
+          'auth'
+        );
+        setCurrentUser(null);
+      } else if (idleSec >= 270) {
+        // 4 Minutes 30 Seconds reached -> Show prompt warning modal with 30s countdown
+        setIsIdleWarningOpen(true);
+        setIdleSecondsRemaining(Math.max(1, 300 - idleSec));
+      } else {
+        if (isIdleWarningOpen) {
+          setIsIdleWarningOpen(false);
+        }
+      }
+    }, 1000);
+
+    return () => {
+      activityEvents.forEach((evt) => {
+        window.removeEventListener(evt, handleUserActivity);
+      });
+      clearInterval(interval);
+    };
+  }, [currentUser, isIdleWarningOpen]);
 
   useEffect(() => {
     try {
@@ -722,6 +798,13 @@ export default function App() {
         auditLogs={auditLogs}
         onClearAuditLogs={handleClearAuditLogs}
         activeYearData={yearData}
+      />
+
+      <InactivityModal
+        isOpen={isIdleWarningOpen}
+        secondsRemaining={idleSecondsRemaining}
+        onStayLoggedIn={handleResetInactivityTimer}
+        onLogoutNow={handleLogout}
       />
     </div>
   );
