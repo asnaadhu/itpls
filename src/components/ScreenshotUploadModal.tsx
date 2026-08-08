@@ -24,14 +24,15 @@ interface ExtractedItem {
   lastYear: number;
 }
 
-// 1. Image Pre-processing for High-Accuracy Local OCR
+// 1. High-DPI Image Pre-processing for Crystal Clear Local OCR
 function preprocessImageForOCR(imageSrc: string): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
-      // Scale up to at least 1400px width for low-res screenshots
-      const scale = Math.max(1, 1400 / Math.max(img.width, 1));
+      // Scale up to at least 1800px width to ensure low-res text and numbers are sharp
+      const targetWidth = 1800;
+      const scale = Math.max(1, targetWidth / Math.max(img.width, 1));
       const width = Math.round(img.width * scale);
       const height = Math.round(img.height * scale);
 
@@ -44,29 +45,91 @@ function preprocessImageForOCR(imageSrc: string): Promise<string> {
         return;
       }
 
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
       ctx.drawImage(img, 0, 0, width, height);
+
       const imgData = ctx.getImageData(0, 0, width, height);
       const data = imgData.data;
 
-      // Increase contrast to sharpen text and numbers
-      const contrast = 1.25;
+      // High-contrast contrast stretching & grayscale thresholding
+      const contrast = 1.35;
       const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
 
       for (let i = 0; i < data.length; i += 4) {
-        const avg = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-        let newVal = factor * (avg - 128) + 128;
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+
+        let newVal = factor * (luminance - 128) + 128;
         newVal = Math.min(255, Math.max(0, newVal));
+
+        // Mild binarization threshold for crisp text
+        if (newVal > 210) newVal = 255;
+        else if (newVal < 85) newVal = 0;
 
         data[i] = newVal;
         data[i + 1] = newVal;
         data[i + 2] = newVal;
       }
+
       ctx.putImageData(imgData, 0, 0);
       resolve(canvas.toDataURL('image/png'));
     };
     img.onerror = () => resolve(imageSrc);
     img.src = imageSrc;
   });
+}
+
+// Smart Financial Number Cleanser with OCR Character Repair
+function cleanAndParseFinancialNumber(rawStr: string): number | null {
+  if (!rawStr) return null;
+  let str = rawStr.trim();
+
+  // Detect percentages
+  if (str.includes('%')) return null;
+
+  // Detect negative formats: (1,234.00), 1,234.00-, -1,234.00
+  let isNegative = false;
+  if (str.startsWith('(') && str.endsWith(')')) {
+    isNegative = true;
+    str = str.slice(1, -1);
+  } else if (str.endsWith('-')) {
+    isNegative = true;
+    str = str.slice(0, -1);
+  } else if (str.startsWith('-')) {
+    isNegative = true;
+    str = str.slice(1);
+  }
+
+  // Remove currency, spaces, commas
+  str = str.replace(/[$€£,\s]/g, '');
+
+  // Repair OCR misread characters in numeric context
+  if (/[A-Za-z]/.test(str)) {
+    str = str
+      .replace(/[OoD]/g, '0')
+      .replace(/[IiLl|!]/g, '1')
+      .replace(/[Zz]/g, '2')
+      .replace(/[S]/g, '5')
+      .replace(/[G]/g, '6')
+      .replace(/[B]/g, '8')
+      .replace(/[q]/g, '9');
+  }
+
+  // Keep digits and decimal point
+  str = str.replace(/[^0-9.]/g, '');
+  if (!str) return null;
+
+  const parts = str.split('.');
+  if (parts.length > 2) {
+    str = parts[0] + '.' + parts.slice(1).join('');
+  }
+
+  const val = parseFloat(str);
+  if (isNaN(val)) return null;
+  return isNegative ? -val : val;
 }
 
 // 2. Fallback Regex Text Line Parser for Raw OCR Output
@@ -99,15 +162,9 @@ function parseTextLinesRegex(fullText: string): ExtractedItem[] {
         continue;
       }
 
-      let numStr = m.replace(/[$ ,]/g, '');
-      let isNeg = false;
-      if (numStr.startsWith('(') && numStr.endsWith(')')) {
-        isNeg = true;
-        numStr = numStr.slice(1, -1);
-      }
-      const val = parseFloat(numStr);
-      if (!isNaN(val)) {
-        cleanNumbers.push(isNeg ? -val : val);
+      const parsedNum = cleanAndParseFinancialNumber(m);
+      if (parsedNum !== null) {
+        cleanNumbers.push(parsedNum);
       }
     }
 
@@ -132,7 +189,7 @@ function parseTextLinesRegex(fullText: string): ExtractedItem[] {
   return items;
 }
 
-// 3. Pure Local Client-Side OCR Engine using Tesseract.js & Spatial Column Detection
+// 3. Pure Local Client-Side OCR Engine using Tesseract.js & Spatial 1D Column Clustering
 async function extractFinancialDataWithOCR(
   imageSrc: string,
   onProgress?: (statusMsg: string) => void
@@ -143,11 +200,11 @@ async function extractFinancialDataWithOCR(
   if (onProgress) onProgress('Initializing local browser OCR engine...');
   const worker = await createWorker('eng');
 
-  if (onProgress) onProgress('Scanning table columns & spatial layout...');
+  if (onProgress) onProgress('Scanning table layout & column alignments...');
   const ret = await worker.recognize(enhancedImage);
   await worker.terminate();
 
-  if (onProgress) onProgress('Detecting Actual, Budget, and Last Year columns...');
+  if (onProgress) onProgress('Clustering Actual, Budget, and Last Year columns...');
 
   const pageData = ret.data as any;
   const lines: any[] = pageData.lines || [];
@@ -167,64 +224,87 @@ async function extractFinancialDataWithOCR(
     }
   }
 
-  // 2. Spatial Column Center Detection
+  // 2. Collect All Number Bounding Box Positions to Auto-Detect Column Coordinates
+  const numberPositions: Array<{ val: number; xCenter: number; yCenter: number }> = [];
+
+  for (const line of lines) {
+    const words = line.words || [];
+    for (const w of words) {
+      const val = cleanAndParseFinancialNumber(w.text);
+      if (val !== null) {
+        // Exclude standalone year numbers e.g. 2024, 2025
+        if (/^\b(19|20)\d{2}\b$/.test(w.text.trim())) continue;
+
+        const xCenter = (w.bbox.x0 + w.bbox.x1) / 2;
+        const yCenter = (w.bbox.y0 + w.bbox.y1) / 2;
+        numberPositions.push({ val, xCenter, yCenter });
+      }
+    }
+  }
+
+  // 1D Density Clustering of X Coordinates to find table column centers
+  const clusters: Array<{ xCenter: number; count: number }> = [];
+  const CLUSTER_TOLERANCE = 45; // pixel tolerance for column alignment
+
+  for (const pos of numberPositions) {
+    let matched = clusters.find((c) => Math.abs(c.xCenter - pos.xCenter) <= CLUSTER_TOLERANCE);
+    if (matched) {
+      matched.xCenter = (matched.xCenter * matched.count + pos.xCenter) / (matched.count + 1);
+      matched.count++;
+    } else {
+      clusters.push({ xCenter: pos.xCenter, count: 1 });
+    }
+  }
+
+  // Sort column clusters from left to right (minimum 3 samples per cluster to be a valid column)
+  const validColumnX = clusters
+    .filter((c) => c.count >= 2)
+    .map((c) => c.xCenter)
+    .sort((a, b) => a - b);
+
+  // 3. Detect Explicit Column Headers if available
   let actualX: number | null = null;
   let budgetX: number | null = null;
   let lastYearX: number | null = null;
   let varianceX: number | null = null;
 
-  const headerKeywordOrder: Array<'actual' | 'budget' | 'lastYear' | 'variance'> = [];
-
   for (const line of lines) {
-    const lineText = (line.text || '').toLowerCase();
-    
-    // Check if line contains header terms
-    if (
-      lineText.includes('actual') ||
-      lineText.includes('budget') ||
-      lineText.includes('last year') ||
-      lineText.includes('prior year') ||
-      lineText.includes('variance') ||
-      lineText.includes('ytd') ||
-      lineText.includes('mtd') ||
-      /\b202\d\b/.test(lineText)
-    ) {
-      const words = line.words || [];
-      for (const w of words) {
-        const wText = w.text.toLowerCase().replace(/[^a-z0-9%]/g, '');
-        const xCenter = (w.bbox.x0 + w.bbox.x1) / 2;
+    const words = line.words || [];
+    for (const w of words) {
+      const wText = w.text.toLowerCase().replace(/[^a-z0-9%]/g, '');
+      const xCenter = (w.bbox.x0 + w.bbox.x1) / 2;
 
-        if (wText.includes('actual') || wText === 'act' || wText === 'mtd' || wText === 'ytd') {
-          if (actualX === null) actualX = xCenter;
-          if (!headerKeywordOrder.includes('actual')) headerKeywordOrder.push('actual');
-        } else if (wText.includes('budget') || wText === 'bgt' || wText === 'plan') {
-          if (budgetX === null) budgetX = xCenter;
-          if (!headerKeywordOrder.includes('budget')) headerKeywordOrder.push('budget');
-        } else if (
-          wText.includes('last') ||
-          wText.includes('prior') ||
-          wText === 'py' ||
-          wText === 'ly' ||
-          wText === '2024' ||
-          wText === '2023'
-        ) {
-          if (lastYearX === null) lastYearX = xCenter;
-          if (!headerKeywordOrder.includes('lastYear')) headerKeywordOrder.push('lastYear');
-        } else if (wText.includes('var') || wText.includes('diff') || wText.includes('%') || wText === 'chg') {
-          if (varianceX === null) varianceX = xCenter;
-          if (!headerKeywordOrder.includes('variance')) headerKeywordOrder.push('variance');
-        }
+      if (wText.includes('actual') || wText === 'act' || wText === 'mtd' || wText === 'ytd') {
+        actualX = xCenter;
+      } else if (wText.includes('budget') || wText === 'bgt' || wText === 'plan') {
+        budgetX = xCenter;
+      } else if (
+        wText.includes('last') ||
+        wText.includes('prior') ||
+        wText === 'py' ||
+        wText === 'ly' ||
+        wText === '2024' ||
+        wText === '2023'
+      ) {
+        lastYearX = xCenter;
+      } else if (wText.includes('var') || wText.includes('diff') || wText.includes('%') || wText === 'chg') {
+        varianceX = xCenter;
       }
     }
   }
 
-  // 3. Process Data Rows
+  // Fallback: If header keywords weren't explicitly found, map detected column clusters to Actual, Budget, LastYear
+  if (actualX === null && validColumnX.length >= 1) actualX = validColumnX[0];
+  if (budgetX === null && validColumnX.length >= 2) budgetX = validColumnX[1];
+  if (lastYearX === null && validColumnX.length >= 3) lastYearX = validColumnX[2];
+
+  // 4. Extract Line Items & Assign Numbers to Columns
   const items: ExtractedItem[] = [];
 
   for (const line of lines) {
     const lineStr = line.text || '';
 
-    // Skip pure header or summary title rows without row numbers
+    // Skip pure header rows without figures
     if (
       /^(actual|budget|last year|variance|ytd|mtd|month|description|item|line item|%\s*change|period|dept)/i.test(
         lineStr.trim()
@@ -235,36 +315,20 @@ async function extractFinancialDataWithOCR(
     }
 
     const words = line.words || [];
-    const numberTokens: Array<{ val: number; xCenter: number; rawText: string; isPercent: boolean }> = [];
+    const numberTokens: Array<{ val: number; xCenter: number; rawText: string }> = [];
     const textWords: string[] = [];
 
     for (const w of words) {
       const raw = w.text.trim();
-      const isPercent = raw.includes('%');
+      const numVal = cleanAndParseFinancialNumber(raw);
 
-      const isNum = /\(?-?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?\)?|\d+(?:\.\d+)?/.test(raw) && !/^[a-zA-Z]/.test(raw);
-
-      if (isNum) {
-        let clean = raw.replace(/[$ ,]/g, '');
-        let isNeg = false;
-
-        if (clean.startsWith('(') && clean.endsWith(')')) {
-          isNeg = true;
-          clean = clean.slice(1, -1);
-        } else if (clean.endsWith('%')) {
-          clean = clean.replace('%', '');
-        }
-
-        const numVal = parseFloat(clean);
-        if (!isNaN(numVal)) {
-          const xCenter = (w.bbox.x0 + w.bbox.x1) / 2;
-          numberTokens.push({
-            val: isNeg ? -numVal : numVal,
-            xCenter,
-            rawText: raw,
-            isPercent,
-          });
-        }
+      if (numVal !== null) {
+        const xCenter = (w.bbox.x0 + w.bbox.x1) / 2;
+        numberTokens.push({
+          val: numVal,
+          xCenter,
+          rawText: raw,
+        });
       } else {
         if (!/^[|$%\-_=]+$/.test(raw)) {
           textWords.push(raw);
@@ -277,52 +341,40 @@ async function extractFinancialDataWithOCR(
       .replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9)]+$/g, '')
       .trim();
 
+    // Clean leading line item numbers e.g. "101. Salaries" or "1 Salaries"
+    lineLabel = lineLabel.replace(/^\d+[\.\-\s]+/, '');
+
     if (lineLabel.length < 2 || /^\d{4}$/.test(lineLabel) || /^page\s*\d+/i.test(lineLabel)) {
       continue;
     }
 
-    const validNumberTokens = numberTokens.filter((t) => !t.isPercent);
-
-    if (validNumberTokens.length > 0) {
+    if (numberTokens.length > 0) {
       let actual = 0;
       let budget = 0;
       let lastYear = 0;
 
-      if (actualX !== null || budgetX !== null || lastYearX !== null) {
-        for (const token of validNumberTokens) {
-          if (varianceX !== null && Math.abs(token.xCenter - varianceX) < 35) {
-            continue;
-          }
-
-          const distances = [
-            { col: 'actual', dist: actualX !== null ? Math.abs(token.xCenter - actualX) : Infinity },
-            { col: 'budget', dist: budgetX !== null ? Math.abs(token.xCenter - budgetX) : Infinity },
-            { col: 'lastYear', dist: lastYearX !== null ? Math.abs(token.xCenter - lastYearX) : Infinity },
-          ];
-
-          distances.sort((a, b) => a.dist - b.dist);
-          const bestCol = distances[0].col;
-
-          if (bestCol === 'actual' && actual === 0) {
-            actual = token.val;
-          } else if (bestCol === 'budget' && budget === 0) {
-            budget = token.val;
-          } else if (bestCol === 'lastYear' && lastYear === 0) {
-            lastYear = token.val;
-          }
-        }
-      } else {
-        const orderedCols = headerKeywordOrder.filter((c) => c !== 'variance');
-        if (orderedCols.length === 0) {
-          orderedCols.push('actual', 'budget', 'lastYear');
+      for (const token of numberTokens) {
+        // Ignore tokens under the Variance column if identified
+        if (varianceX !== null && Math.abs(token.xCenter - varianceX) < 35) {
+          continue;
         }
 
-        validNumberTokens.forEach((token, idx) => {
-          const targetCol = orderedCols[idx] || (idx === 0 ? 'actual' : idx === 1 ? 'budget' : 'lastYear');
-          if (targetCol === 'actual') actual = token.val;
-          if (targetCol === 'budget') budget = token.val;
-          if (targetCol === 'lastYear') lastYear = token.val;
-        });
+        const distances = [
+          { col: 'actual', dist: actualX !== null ? Math.abs(token.xCenter - actualX) : Infinity },
+          { col: 'budget', dist: budgetX !== null ? Math.abs(token.xCenter - budgetX) : Infinity },
+          { col: 'lastYear', dist: lastYearX !== null ? Math.abs(token.xCenter - lastYearX) : Infinity },
+        ];
+
+        distances.sort((a, b) => a.dist - b.dist);
+        const bestCol = distances[0].col;
+
+        if (bestCol === 'actual' && actual === 0) {
+          actual = token.val;
+        } else if (bestCol === 'budget' && budget === 0) {
+          budget = token.val;
+        } else if (bestCol === 'lastYear' && lastYear === 0) {
+          lastYear = token.val;
+        }
       }
 
       items.push({
