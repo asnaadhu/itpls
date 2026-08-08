@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { GoogleGenAI } from '@google/genai';
 import {
   AlertCircle,
   Bot,
@@ -12,6 +13,69 @@ import {
 } from 'lucide-react';
 import { MONTH_NAMES } from '../data/defaultData';
 import { YearData } from '../types';
+
+async function extractFinancialDataClientSide(base64: string, mimeType: string, apiKey: string) {
+  const ai = new GoogleGenAI({ apiKey });
+  const cleanBase64 = base64.replace(/^data:image\/\w+;base64,/, '');
+
+  const promptText = `Analyze this financial statement / expense report screenshot.
+Extract:
+1. The month name shown in the table header or title (e.g. "July", "January", "August", etc.). If not found, return an empty string.
+2. Every line item in the table along with its numerical values for Actual, Budget, and Last Year.
+Note:
+- Ignore all percentage columns (columns with '%' header).
+- Clean formatted numbers like "23,091" or "$1,151" to integer numbers (e.g. 23091, 1151).
+- If a value is 0, blank, or missing, set it to 0.
+- Extract individual expense line items accurately (e.g., Salaries & Wages, Cost of Cell Phones, Dues and Subscriptions, etc.).
+
+Return strictly valid JSON with format:
+{
+  "monthName": "Month string or empty",
+  "items": [
+    {
+      "lineItemName": "Line item title",
+      "actual": 0,
+      "budget": 0,
+      "lastYear": 0
+    }
+  ]
+}`;
+
+  const modelsToTry = ['gemini-3.6-flash', 'gemini-flash-latest'];
+  let responseText = '';
+  let lastErr: any = null;
+
+  for (const modelName of modelsToTry) {
+    try {
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: [
+          {
+            parts: [
+              { inlineData: { mimeType, data: cleanBase64 } },
+              { text: promptText },
+            ],
+          },
+        ],
+        config: {
+          responseMimeType: 'application/json',
+        },
+      });
+      if (response && response.text) {
+        responseText = response.text;
+        break;
+      }
+    } catch (e: any) {
+      lastErr = e;
+    }
+  }
+
+  if (!responseText) {
+    throw new Error(lastErr?.message || 'Client-side Gemini extraction failed.');
+  }
+
+  return JSON.parse(responseText);
+}
 
 interface ExtractedItem {
   lineItemName: string;
@@ -135,41 +199,64 @@ export const ScreenshotUploadModal: React.FC<ScreenshotUploadModalProps> = ({
       // 1. Compress image to max 1600px & JPEG to ensure lightweight payload
       const { base64, mimeType } = await compressImageForAI(imagePreviewUrl);
 
-      // 2. Post to backend endpoint
-      const response = await fetch('/api/parse-financial-screenshot', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          imageBase64: base64,
-          mimeType,
-        }),
-      });
+      let extractedData: any = null;
+      const viteApiKey = (import.meta as any).env?.VITE_GEMINI_API_KEY;
 
-      // 3. Safely read text first to prevent JSON.parse crashes on empty/HTML error bodies
-      const responseText = await response.text();
-      let resData: any = {};
-
-      if (response.status === 405) {
-        throw new Error(
-          "HTTP 405 (Method Not Allowed): Your hosting provider (e.g. Cloudflare Pages static hosting) rejects POST requests to static routes. To run API endpoints like Gemini AI, you must host this app using Node.js (Express server.ts) or set up a Cloudflare Pages Function at /functions/api/parse-financial-screenshot.js."
-        );
-      }
-
+      // 2. Post to backend/Cloudflare endpoint
       try {
-        resData = responseText ? JSON.parse(responseText) : {};
-      } catch (_e) {
-        throw new Error(
-          `Server returned non-JSON response (HTTP ${response.status}): ${
-            responseText ? responseText.slice(0, 120) : 'Empty response received from server.'
-          }`
-        );
+        const response = await fetch('/api/parse-financial-screenshot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            imageBase64: base64,
+            mimeType,
+          }),
+        });
+
+        if (response.status === 405 || response.status === 404) {
+          if (viteApiKey) {
+            extractedData = await extractFinancialDataClientSide(base64, mimeType, viteApiKey);
+          } else {
+            throw new Error(
+              "HTTP 405 (Method Not Allowed): Cloudflare Pages static hosting received a POST request to /api/parse-financial-screenshot.\n\n" +
+              "To fix this on Cloudflare Pages:\n" +
+              "1. Make sure you push the /functions folder to your repository.\n" +
+              "2. In Cloudflare Pages Settings -> Environment Variables, add 'GEMINI_API_KEY' (or 'VITE_GEMINI_API_KEY').\n" +
+              "3. Re-deploy your site on Cloudflare Pages so the Cloudflare Function is registered."
+            );
+          }
+        } else {
+          const responseText = await response.text();
+          let resData: any = {};
+          try {
+            resData = responseText ? JSON.parse(responseText) : {};
+          } catch (_e) {
+            throw new Error(
+              `Server returned non-JSON response (HTTP ${response.status}): ${
+                responseText ? responseText.slice(0, 120) : 'Empty response received.'
+              }`
+            );
+          }
+
+          if (!response.ok || !resData.success) {
+            throw new Error(resData.error || resData.message || 'Failed to extract financial statement data.');
+          }
+
+          extractedData = resData.data;
+        }
+      } catch (backendErr: any) {
+        if (viteApiKey && !extractedData) {
+          try {
+            extractedData = await extractFinancialDataClientSide(base64, mimeType, viteApiKey);
+          } catch (clientErr: any) {
+            throw new Error(`${backendErr.message} (Client-side fallback error: ${clientErr.message})`);
+          }
+        } else {
+          throw backendErr;
+        }
       }
 
-      if (!response.ok || !resData.success) {
-        throw new Error(resData.error || resData.message || 'Failed to extract financial statement data.');
-      }
-
-      const { monthName, items } = resData.data || {};
+      const { monthName, items } = extractedData || {};
 
       setExtractedMonthName(monthName || '');
       setExtractedItems(items || []);
